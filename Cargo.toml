@@ -1,0 +1,12 @@
+[package]
+name = "mega-clipboard"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+iced = { version = "0.14.0", features = ["tokio", "image"] }
+arboard = "3.4"
+image = "0.25"
+chrono = "0.4"
+directories = "6.0" 
+tray-icon = "0.19"
