@@ -1,31 +1,44 @@
+#![windows_subsystem = "windows"]
+
 use arboard::Clipboard;
-use chrono::{Local, DateTime, Duration};
+use chrono::{Local, DateTime, Duration, TimeZone}; // Добавили TimeZone
 use directories::UserDirs;
 use image::{ImageBuffer, Rgba};
-use iced::widget::{button, column, container, scrollable, text, space, image as iced_image, text_input, slider, row, checkbox};
-use iced::{time, Color, Element, Length, Subscription, Task, window, Alignment};
+use iced::widget::{button, column, container, scrollable, text, space, image as iced_image, text_input, row, checkbox, slider};
+use iced::{time, Color, Element, Length, Subscription, Task, window, Alignment, Size, Point};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::time::{Instant, Duration as StdDuration};
 use tray_icon::{
     menu::{Menu, MenuItem, MenuEvent},
     TrayIconBuilder, TrayIcon, MouseButton, TrayIconEvent, Icon,
 };
+use global_hotkey::{GlobalHotKeyManager, hotkey::{HotKey, Modifiers, Code}, GlobalHotKeyEvent};
 use winreg::enums::*;
 use winreg::RegKey;
 use std::env;
 
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    SystemParametersInfoA, SPI_GETWORKAREA,
+    FindWindowA, ShowWindow, SW_HIDE, SW_SHOW, SetForegroundWindow
+};
+
 const APP_NAME: &str = "MegaClipboard";
+const WIN_WIDTH: f32 = 650.0;
+const WIN_HEIGHT: f32 = 750.0;
 
 struct AppState {
     last_text: String,
     last_image_hash: Vec<u8>,
     history: Vec<HistoryItem>,
-    _tray: Arc<TrayIcon>,
+    _tray: TrayIcon,
+    _hotkey_manager: GlobalHotKeyManager,
+    is_visible: bool,
+    last_toggle_time: Instant,
     search_query: String,
-    days_filter: f32,
     auto_start: bool,
+    days_filter: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -44,13 +57,11 @@ enum Message {
     CopyToClipboard(String, bool),
     ToggleExpand(usize),
     DeleteItem(usize),
-    CloseRequested,
-    TrayEvent(TrayIconEvent),
-    MenuEvent(MenuEvent),
     SetVisibility(bool),
+    ToggleVisibility,
     SearchChanged(String),
-    FilterChanged(f32),
     ToggleAutoStart(bool),
+    FilterChanged(f32),
 }
 
 #[derive(Debug, Clone)]
@@ -61,7 +72,8 @@ enum ClipboardContent {
 }
 
 fn load_icon() -> Icon {
-    if let Ok(img) = image::open("src/icon.ico") {
+    let icon_bytes = include_bytes!("icon.ico");
+    if let Ok(img) = image::load_from_memory(icon_bytes) {
         let rgba = img.to_rgba8();
         let (w, h) = rgba.dimensions();
         Icon::from_rgba(rgba.into_raw(), w, h).unwrap_or_else(|_| Icon::from_rgba(vec![0; 32 * 32 * 4], 32, 32).unwrap())
@@ -117,13 +129,16 @@ fn load_history() -> Vec<HistoryItem> {
         for line in reader.lines().flatten() {
             if let (Some(t_start), Some(t_end)) = (line.find('['), line.find(']')) {
                 let time_str = &line[t_start+1..t_end];
-                let dt = DateTime::parse_from_str(&(time_str.to_owned() + " +0000"), "%Y-%m-%d %H:%M:%S %z")
-                    .map(|d| d.with_timezone(&Local))
-                    .unwrap_or_else(|_| Local::now());
+                
+                // Исправленный парсинг: читаем как есть, без смещения UTC
+                let dt = chrono::NaiveDateTime::parse_from_str(time_str, "%Y-%m-%d %H:%M:%S")
+                    .ok()
+                    .and_then(|naive| Local.from_local_datetime(&naive).single())
+                    .unwrap_or_else(|| Local::now());
 
                 let rest = &line[t_end+1..];
                 if let Some(sep) = rest.find(": ") {
-                    let kind_part = &rest[..sep].trim();
+                    let kind_part = rest[..sep].trim();
                     let content = &rest[sep+2..];
                     let is_image = kind_part.contains("IMAGE");
                     let mut handle = None;
@@ -142,6 +157,14 @@ fn load_history() -> Vec<HistoryItem> {
 fn update(state: &mut AppState, message: Message) -> Task<Message> {
     match message {
         Message::Tick => {
+            let mut hotkey_detected = false;
+            while let Ok(_) = GlobalHotKeyEvent::receiver().try_recv() { hotkey_detected = true; }
+            if hotkey_detected {
+                if state.last_toggle_time.elapsed() > StdDuration::from_millis(300) {
+                    state.last_toggle_time = Instant::now();
+                    return Task::done(Message::ToggleVisibility);
+                }
+            }
             while let Ok(event) = TrayIconEvent::receiver().try_recv() {
                 if let TrayIconEvent::Click { button: MouseButton::Left, .. } = event {
                     return Task::done(Message::SetVisibility(true));
@@ -151,24 +174,29 @@ fn update(state: &mut AppState, message: Message) -> Task<Message> {
                 if event.id.as_ref() == "open" { return Task::done(Message::SetVisibility(true)); }
                 if event.id.as_ref() == "quit" { std::process::exit(0); }
             }
-            return Task::perform(async { check_clipboard_async() }, Message::ClipboardChecked);
+            static mut LAST_CLIP_CHECK: Option<Instant> = None;
+            unsafe {
+                if LAST_CLIP_CHECK.is_none() || LAST_CLIP_CHECK.unwrap().elapsed() > StdDuration::from_millis(500) {
+                    LAST_CLIP_CHECK = Some(Instant::now());
+                    return Task::perform(async { check_clipboard_async() }, Message::ClipboardChecked);
+                }
+            }
         }
-        Message::TrayEvent(_) | Message::MenuEvent(_) => {}
-        Message::SearchChanged(q) => state.search_query = q,
-        Message::FilterChanged(f) => state.days_filter = f,
-        Message::ToggleAutoStart(enabled) => {
-            state.auto_start = enabled;
-            set_auto_start(enabled);
-        }
+        Message::ToggleVisibility => return Task::done(Message::SetVisibility(!state.is_visible)),
         Message::SetVisibility(show) => {
-            use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowA, ShowWindow, SW_HIDE, SW_SHOW};
+            state.is_visible = show;
             unsafe {
                 let title = b"Mega Clipboard\0";
                 let hwnd = FindWindowA(std::ptr::null(), title.as_ptr());
-                if !hwnd.is_null() { ShowWindow(hwnd, if show { SW_SHOW } else { SW_HIDE }); }
+                if !hwnd.is_null() { 
+                    if show { ShowWindow(hwnd, SW_SHOW); SetForegroundWindow(hwnd); }
+                    else { ShowWindow(hwnd, SW_HIDE); }
+                }
             }
         }
-        Message::CloseRequested => return Task::done(Message::SetVisibility(false)),
+        Message::SearchChanged(q) => state.search_query = q,
+        Message::FilterChanged(f) => state.days_filter = f,
+        Message::ToggleAutoStart(enabled) => { state.auto_start = enabled; set_auto_start(enabled); }
         Message::ToggleExpand(idx) => if let Some(item) = state.history.get_mut(idx) { item.expanded = !item.expanded; },
         Message::DeleteItem(idx) => {
             let app_dir = get_app_dir();
@@ -178,17 +206,17 @@ fn update(state: &mut AppState, message: Message) -> Task<Message> {
             state.history.remove(idx);
             rewrite_log(&app_dir, &state.history);
         }
-        Message::ClipboardChecked(Ok(content)) => {
+        Message::ClipboardChecked(result) => {
             let app_dir = get_app_dir();
-            match content {
-                ClipboardContent::Text(new_text) => {
+            match result {
+                Ok(ClipboardContent::Text(new_text)) => {
                     if !new_text.is_empty() && new_text != state.last_text {
                         state.last_text = new_text.clone();
                         state.history.push(HistoryItem { datetime: Local::now(), content: new_text, is_image: false, image_handle: None, expanded: false });
                         rewrite_log(&app_dir, &state.history);
                     }
                 }
-                ClipboardContent::Image(bytes, w, h) => {
+                Ok(ClipboardContent::Image(bytes, w, h)) => {
                     if bytes != state.last_image_hash {
                         state.last_image_hash = bytes.clone();
                         let filename = format!("img_{}.png", Local::now().format("%Y%m%d_%H%M%S"));
@@ -205,11 +233,10 @@ fn update(state: &mut AppState, message: Message) -> Task<Message> {
                 _ => {}
             }
         }
-        Message::ClipboardChecked(Err(_)) => {} // Игнорируем ошибки чтения буфера
         Message::CopyToClipboard(content, is_image) => {
             if is_image {
                 let img_path = get_app_dir().join("captures").join(&content);
-                if let Some(img) = image::ImageReader::open(img_path).ok().and_then(|r| r.decode().ok()) {
+                if let Ok(img) = image::ImageReader::open(img_path).and_then(|r| r.decode().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))) {
                     let rgba = img.to_rgba8();
                     let data = arboard::ImageData { width: rgba.width() as usize, height: rgba.height() as usize, bytes: std::borrow::Cow::from(rgba.into_raw()) };
                     let _ = Clipboard::new().and_then(|mut cb| cb.set_image(data));
@@ -222,17 +249,34 @@ fn update(state: &mut AppState, message: Message) -> Task<Message> {
 
 fn view(state: &AppState) -> Element<'_, Message> {
     let now = Local::now();
-    let search_bar = text_input("Поиск по истории...", &state.search_query).on_input(Message::SearchChanged).padding(10);
-    let filter_label = if state.days_filter < 1.0 { "За всё время".to_string() } else { format!("За последние {} дн.", state.days_filter as i32) };
-    let date_slider = row![text(filter_label).width(Length::Fixed(150.0)), slider(0.0..=30.0, state.days_filter, Message::FilterChanged)].spacing(10).align_y(Alignment::Center);
+    let search_bar = text_input("Поиск (текст или дата ДД.ММ)...", &state.search_query).on_input(Message::SearchChanged).padding(10);
+    
+    let filter_label = if state.days_filter < 1.0 { "За всё время".to_string() } 
+                       else { format!("За последние {} дн.", state.days_filter as i32) };
+
+    let date_filter_row = row![
+        text(filter_label).size(14).color(Color::WHITE).width(Length::Fixed(150.0)),
+        slider(0.0..=90.0, state.days_filter, Message::FilterChanged)
+    ].spacing(10).align_y(Alignment::Center);
 
     let mut history_column = column![].spacing(10);
     for (i, item) in state.history.iter().enumerate().rev() {
-        let query_match = state.search_query.is_empty() || item.content.to_lowercase().contains(&state.search_query.to_lowercase());
-        let date_match = state.days_filter < 1.0 || (now - item.datetime) < Duration::days(state.days_filter as i64);
+        let query = state.search_query.to_lowercase();
+        
+        // Исправленная логика поиска: теперь ищет по ДД.ММ
+        let query_match = query.is_empty() 
+            || item.content.to_lowercase().contains(&query)
+            || item.datetime.format("%d.%m").to_string().contains(&query)
+            || item.datetime.format("%d.%m.%Y").to_string().contains(&query);
+
+        let date_match = state.days_filter < 1.0 
+            || (now - item.datetime) < Duration::days(state.days_filter as i64);
 
         if query_match && date_match {
-            let mut card_column = column![text(item.datetime.format("%d.%m %H:%M:%S").to_string()).size(11).color(Color::from_rgb(0.5, 0.5, 0.5))].spacing(5);
+            let mut card_column = column![
+                text(item.datetime.format("%d.%m %H:%M:%S").to_string()).size(11).color(Color::from_rgb(0.7, 0.7, 0.7))
+            ].spacing(5);
+            
             if item.is_image {
                 if let Some(handle) = &item.image_handle {
                     let (w, h) = if item.expanded { (400, 300) } else { (150, 100) };
@@ -240,17 +284,26 @@ fn view(state: &AppState) -> Element<'_, Message> {
                 }
             } else {
                 let displayed = if item.expanded { item.content.clone() } else { item.content.chars().take(100).collect::<String>() + if item.content.len() > 100 { "..." } else { "" } };
-                card_column = card_column.push(button(text(displayed).size(14)).on_press(Message::ToggleExpand(i)).style(|_, _| button::Style::default()));
+                card_column = card_column.push(button(text(displayed).size(14).color(Color::WHITE)).on_press(Message::ToggleExpand(i)).style(|_, _| button::Style::default()));
             }
-            let buttons = row![button("Копировать").on_press(Message::CopyToClipboard(item.content.clone(), item.is_image)).padding(5), button("Удалить").on_press(Message::DeleteItem(i)).padding(5)].spacing(10);
+            
+            let buttons = row![
+                button(text("Копировать").color(Color::WHITE)).on_press(Message::CopyToClipboard(item.content.clone(), item.is_image)).padding(5), 
+                button(text("Удалить").color(Color::WHITE)).on_press(Message::DeleteItem(i)).padding(5)
+            ].spacing(10);
+            
             history_column = history_column.push(container(column![card_column, buttons].spacing(10)).padding(12).width(Length::Fill).style(|_| container::Style { background: Some(iced::Background::Color(Color::from_rgb(0.18, 0.18, 0.18))), border: iced::Border { radius: 8.0.into(), ..Default::default() }, ..Default::default() }));
         }
     }
 
     container(column![
-        row![text("Mega Clipboard Pro").size(26).color(Color::from_rgb(0.4, 0.6, 1.0)), space().width(Length::Fill), row![text("Автозапуск").size(14), checkbox(state.auto_start).on_toggle(Message::ToggleAutoStart)].spacing(5).align_y(Alignment::Center)].align_y(Alignment::Center),
-        space().height(10), search_bar, date_slider, space().height(10), scrollable(history_column).height(Length::Fill)
-    ].spacing(10)).padding(25).style(|_| container::Style { background: Some(iced::Background::Color(Color::from_rgb(0.08, 0.08, 0.08))), ..Default::default() }).into()
+        row![
+            text("Mega Clipboard Pro").size(26).color(Color::WHITE),
+            space().width(Length::Fill), 
+            row![text("Автозапуск").size(14).color(Color::WHITE), checkbox(state.auto_start).on_toggle(Message::ToggleAutoStart)].spacing(5).align_y(Alignment::Center)
+        ].align_y(Alignment::Center),
+        space().height(10), search_bar, date_filter_row, space().height(10), scrollable(history_column).height(Length::Fill)
+    ].spacing(10)).padding(25).style(|_| container::Style { background: Some(iced::Background::Color(Color::from_rgb(0.08, 0.08, 0.08))), border: iced::Border { radius: 12.0.into(), ..Default::default() }, ..Default::default() }).into()
 }
 
 fn check_clipboard_async() -> Result<ClipboardContent, String> {
@@ -261,18 +314,43 @@ fn check_clipboard_async() -> Result<ClipboardContent, String> {
 }
 
 fn subscription(_state: &AppState) -> Subscription<Message> {
-    Subscription::batch(vec![
-        time::every(std::time::Duration::from_millis(200)).map(|_| Message::Tick),
-        iced::event::listen_with(|event, _status, _id| if let iced::Event::Window(window::Event::CloseRequested) = event { Some(Message::CloseRequested) } else { None }),
-    ])
+    time::every(StdDuration::from_millis(30)).map(|_| Message::Tick)
 }
 
 fn main() -> iced::Result {
-    let tray_menu = Menu::new();
-    let _ = tray_menu.append(&MenuItem::with_id("open", "Открыть", true, None));
-    let _ = tray_menu.append(&MenuItem::with_id("quit", "Выйти", true, None));
-    let tray = Arc::new(TrayIconBuilder::new().with_menu(Box::new(tray_menu)).with_tooltip("Mega Clipboard").with_icon(load_icon()).build().unwrap());
-    
-    iced::application(move || AppState { history: load_history(), _tray: tray.clone(), last_text: String::new(), last_image_hash: Vec::new(), search_query: String::new(), days_filter: 0.0, auto_start: check_auto_start() }, update, view)
-        .subscription(subscription).title("Mega Clipboard").window(window::Settings { exit_on_close_request: false, ..Default::default() }).run()
+    let (x, y) = unsafe {
+        let mut work_area: [i32; 4] = [0; 4];
+        SystemParametersInfoA(SPI_GETWORKAREA, 0, work_area.as_mut_ptr() as *mut _, 0);
+        let wa_width = work_area[2] - work_area[0];
+        let wa_bottom = work_area[3];
+        ((work_area[0] + (wa_width - WIN_WIDTH as i32) / 2), (wa_bottom - WIN_HEIGHT as i32 - 10))
+    };
+
+    iced::application(
+        move || {
+            let tray_menu = Menu::new();
+            let _ = tray_menu.append(&MenuItem::with_id("open", "Открыть", true, None));
+            let _ = tray_menu.append(&MenuItem::with_id("quit", "Выйти", true, None));
+            let tray = TrayIconBuilder::new().with_menu(Box::new(tray_menu)).with_tooltip("Mega Clipboard").with_icon(load_icon()).build().unwrap();
+            let hotkey_manager = GlobalHotKeyManager::new().unwrap();
+            let _ = hotkey_manager.register(HotKey::new(Some(Modifiers::ALT), Code::KeyV));
+
+            AppState { 
+                history: load_history(), _tray: tray, _hotkey_manager: hotkey_manager, is_visible: true,
+                last_toggle_time: Instant::now(), last_text: String::new(), last_image_hash: Vec::new(), 
+                search_query: String::new(), auto_start: check_auto_start(), days_filter: 0.0 
+            }
+        }, 
+        update, view
+    )
+    .subscription(subscription)
+    .title("Mega Clipboard")
+    .window(window::Settings { 
+        size: Size::new(WIN_WIDTH, WIN_HEIGHT),
+        position: window::Position::Specific(Point::new(x as f32, y as f32)),
+        resizable: false, decorations: false, transparent: true,
+        exit_on_close_request: false,
+        ..Default::default() 
+    })
+    .run()
 }
