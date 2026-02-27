@@ -1,2 +1,3 @@
 # Mega-Clipboard
-## Alt + v just use it
+## **Hotkey**
+## **Alt + V - open programm**
