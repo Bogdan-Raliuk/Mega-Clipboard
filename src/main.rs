@@ -1,7 +1,7 @@
 #![windows_subsystem = "windows"]
 
 use arboard::Clipboard;
-use chrono::{Local, DateTime, Duration, TimeZone}; // Добавили TimeZone
+use chrono::{Local, DateTime, Duration, TimeZone}; 
 use directories::UserDirs;
 use image::{ImageBuffer, Rgba};
 use iced::widget::{button, column, container, scrollable, text, space, image as iced_image, text_input, row, checkbox, slider};
@@ -39,6 +39,7 @@ struct AppState {
     search_query: String,
     auto_start: bool,
     days_filter: f32,
+    only_favorites: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +49,7 @@ struct HistoryItem {
     is_image: bool,
     image_handle: Option<iced_image::Handle>,
     expanded: bool,
+    is_favorite: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -57,11 +59,13 @@ enum Message {
     CopyToClipboard(String, bool),
     ToggleExpand(usize),
     DeleteItem(usize),
+    ToggleFavorite(usize),
     SetVisibility(bool),
     ToggleVisibility,
     SearchChanged(String),
     ToggleAutoStart(bool),
     FilterChanged(f32),
+    ToggleFavoriteFilter(bool),
 }
 
 #[derive(Debug, Clone)]
@@ -115,7 +119,8 @@ fn rewrite_log(app_dir: &Path, history: &[HistoryItem]) {
     if let Ok(mut file) = std::fs::File::create(log_path) {
         for item in history {
             let kind = if item.is_image { "IMAGE" } else { "TEXT" };
-            let _ = writeln!(file, "[{}] {}: {}", item.datetime.format("%Y-%m-%d %H:%M:%S"), kind, item.content.replace('\n', " "));
+            let fav = if item.is_favorite { "FAV" } else { "REG" };
+            let _ = writeln!(file, "[{}] {} {}: {}", item.datetime.format("%Y-%m-%d %H:%M:%S"), fav, kind, item.content.replace('\n', " "));
         }
     }
 }
@@ -129,16 +134,16 @@ fn load_history() -> Vec<HistoryItem> {
         for line in reader.lines().flatten() {
             if let (Some(t_start), Some(t_end)) = (line.find('['), line.find(']')) {
                 let time_str = &line[t_start+1..t_end];
-                
-                // Исправленный парсинг: читаем как есть, без смещения UTC
                 let dt = chrono::NaiveDateTime::parse_from_str(time_str, "%Y-%m-%d %H:%M:%S")
                     .ok()
                     .and_then(|naive| Local.from_local_datetime(&naive).single())
                     .unwrap_or_else(|| Local::now());
 
-                let rest = &line[t_end+1..];
+                let rest = &line[t_end+1..].trim();
+                let is_favorite = rest.starts_with("FAV");
+                
                 if let Some(sep) = rest.find(": ") {
-                    let kind_part = rest[..sep].trim();
+                    let kind_part = &rest[..sep];
                     let content = &rest[sep+2..];
                     let is_image = kind_part.contains("IMAGE");
                     let mut handle = None;
@@ -146,7 +151,7 @@ fn load_history() -> Vec<HistoryItem> {
                         let img_path = app_dir.join("captures").join(content);
                         if img_path.exists() { handle = Some(iced_image::Handle::from_path(img_path)); }
                     }
-                    items.push(HistoryItem { datetime: dt, content: content.to_string(), is_image, image_handle: handle, expanded: false });
+                    items.push(HistoryItem { datetime: dt, content: content.to_string(), is_image, image_handle: handle, expanded: false, is_favorite });
                 }
             }
         }
@@ -196,8 +201,15 @@ fn update(state: &mut AppState, message: Message) -> Task<Message> {
         }
         Message::SearchChanged(q) => state.search_query = q,
         Message::FilterChanged(f) => state.days_filter = f,
+        Message::ToggleFavoriteFilter(val) => state.only_favorites = val,
         Message::ToggleAutoStart(enabled) => { state.auto_start = enabled; set_auto_start(enabled); }
         Message::ToggleExpand(idx) => if let Some(item) = state.history.get_mut(idx) { item.expanded = !item.expanded; },
+        Message::ToggleFavorite(idx) => {
+            if let Some(item) = state.history.get_mut(idx) {
+                item.is_favorite = !item.is_favorite;
+                rewrite_log(&get_app_dir(), &state.history);
+            }
+        }
         Message::DeleteItem(idx) => {
             let app_dir = get_app_dir();
             if let Some(item) = state.history.get(idx) {
@@ -212,7 +224,7 @@ fn update(state: &mut AppState, message: Message) -> Task<Message> {
                 Ok(ClipboardContent::Text(new_text)) => {
                     if !new_text.is_empty() && new_text != state.last_text {
                         state.last_text = new_text.clone();
-                        state.history.push(HistoryItem { datetime: Local::now(), content: new_text, is_image: false, image_handle: None, expanded: false });
+                        state.history.push(HistoryItem { datetime: Local::now(), content: new_text, is_image: false, image_handle: None, expanded: false, is_favorite: false });
                         rewrite_log(&app_dir, &state.history);
                     }
                 }
@@ -224,7 +236,7 @@ fn update(state: &mut AppState, message: Message) -> Task<Message> {
                         let _ = fs::create_dir_all(app_dir.join("captures"));
                         if let Some(img) = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(w, h, bytes) {
                             if img.save(&full_path).is_ok() {
-                                state.history.push(HistoryItem { datetime: Local::now(), content: filename, is_image: true, image_handle: Some(iced_image::Handle::from_path(&full_path)), expanded: false });
+                                state.history.push(HistoryItem { datetime: Local::now(), content: filename, is_image: true, image_handle: Some(iced_image::Handle::from_path(&full_path)), expanded: false, is_favorite: false });
                                 rewrite_log(&app_dir, &state.history);
                             }
                         }
@@ -256,25 +268,32 @@ fn view(state: &AppState) -> Element<'_, Message> {
 
     let date_filter_row = row![
         text(filter_label).size(14).color(Color::WHITE).width(Length::Fixed(150.0)),
-        slider(0.0..=90.0, state.days_filter, Message::FilterChanged)
+        slider(0.0..=90.0, state.days_filter, Message::FilterChanged),
+        space().width(Length::Fill),
+        text("Только ★").size(14).color(Color::WHITE),
+        checkbox(state.only_favorites).on_toggle(Message::ToggleFavoriteFilter)
     ].spacing(10).align_y(Alignment::Center);
 
     let mut history_column = column![].spacing(10);
     for (i, item) in state.history.iter().enumerate().rev() {
         let query = state.search_query.to_lowercase();
-        
-        // Исправленная логика поиска: теперь ищет по ДД.ММ
         let query_match = query.is_empty() 
             || item.content.to_lowercase().contains(&query)
             || item.datetime.format("%d.%m").to_string().contains(&query)
             || item.datetime.format("%d.%m.%Y").to_string().contains(&query);
 
-        let date_match = state.days_filter < 1.0 
-            || (now - item.datetime) < Duration::days(state.days_filter as i64);
+        let date_match = state.days_filter < 1.0 || (now - item.datetime) < Duration::days(state.days_filter as i64);
+        let fav_match = !state.only_favorites || item.is_favorite;
 
-        if query_match && date_match {
+        if query_match && date_match && fav_match {
             let mut card_column = column![
-                text(item.datetime.format("%d.%m %H:%M:%S").to_string()).size(11).color(Color::from_rgb(0.7, 0.7, 0.7))
+                row![
+                    text(item.datetime.format("%d.%m %H:%M:%S").to_string()).size(11).color(Color::from_rgb(0.7, 0.7, 0.7)),
+                    space().width(Length::Fill),
+                    button(text(if item.is_favorite { "★" } else { "☆" }).color(if item.is_favorite { Color::from_rgb(1.0, 0.8, 0.0) } else { Color::WHITE }))
+                        .on_press(Message::ToggleFavorite(i))
+                        .style(|_, _| button::Style::default())
+                ].align_y(Alignment::Center)
             ].spacing(5);
             
             if item.is_image {
@@ -326,6 +345,8 @@ fn main() -> iced::Result {
         ((work_area[0] + (wa_width - WIN_WIDTH as i32) / 2), (wa_bottom - WIN_HEIGHT as i32 - 10))
     };
 
+    let icon_bytes = include_bytes!("icon.ico");
+
     iced::application(
         move || {
             let tray_menu = Menu::new();
@@ -336,9 +357,9 @@ fn main() -> iced::Result {
             let _ = hotkey_manager.register(HotKey::new(Some(Modifiers::ALT), Code::KeyV));
 
             AppState { 
-                history: load_history(), _tray: tray, _hotkey_manager: hotkey_manager, is_visible: true,
+                history: load_history(), _tray: tray, _hotkey_manager: hotkey_manager, is_visible: false,
                 last_toggle_time: Instant::now(), last_text: String::new(), last_image_hash: Vec::new(), 
-                search_query: String::new(), auto_start: check_auto_start(), days_filter: 0.0 
+                search_query: String::new(), auto_start: check_auto_start(), days_filter: 0.0, only_favorites: false
             }
         }, 
         update, view
@@ -348,7 +369,8 @@ fn main() -> iced::Result {
     .window(window::Settings { 
         size: Size::new(WIN_WIDTH, WIN_HEIGHT),
         position: window::Position::Specific(Point::new(x as f32, y as f32)),
-        resizable: false, decorations: false, transparent: true,
+        resizable: false, decorations: false, transparent: true, visible: false,
+        icon: Some(window::icon::from_file_data(icon_bytes, None).unwrap()),
         exit_on_close_request: false,
         ..Default::default() 
     })
