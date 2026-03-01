@@ -40,6 +40,7 @@ struct AppState {
     auto_start: bool,
     days_filter: f32,
     only_favorites: bool,
+    only_images: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +67,7 @@ enum Message {
     ToggleAutoStart(bool),
     FilterChanged(f32),
     ToggleFavoriteFilter(bool),
+    ToggleImageFilter(bool),
 }
 
 #[derive(Debug, Clone)]
@@ -202,6 +204,7 @@ fn update(state: &mut AppState, message: Message) -> Task<Message> {
         Message::SearchChanged(q) => state.search_query = q,
         Message::FilterChanged(f) => state.days_filter = f,
         Message::ToggleFavoriteFilter(val) => state.only_favorites = val,
+        Message::ToggleImageFilter(val) => state.only_images = val,
         Message::ToggleAutoStart(enabled) => { state.auto_start = enabled; set_auto_start(enabled); }
         Message::ToggleExpand(idx) => if let Some(item) = state.history.get_mut(idx) { item.expanded = !item.expanded; },
         Message::ToggleFavorite(idx) => {
@@ -270,9 +273,9 @@ fn view(state: &AppState) -> Element<'_, Message> {
         text(filter_label).size(14).color(Color::WHITE).width(Length::Fixed(150.0)),
         slider(0.0..=90.0, state.days_filter, Message::FilterChanged),
         space().width(Length::Fill),
-        text("Только ★").size(14).color(Color::WHITE),
-        checkbox(state.only_favorites).on_toggle(Message::ToggleFavoriteFilter)
-    ].spacing(10).align_y(Alignment::Center);
+        row![text("★").size(14).color(Color::WHITE), checkbox(state.only_favorites).on_toggle(Message::ToggleFavoriteFilter)].spacing(5).align_y(Alignment::Center),
+        row![text("🖼").size(14).color(Color::WHITE), checkbox(state.only_images).on_toggle(Message::ToggleImageFilter)].spacing(5).align_y(Alignment::Center)
+    ].spacing(15).align_y(Alignment::Center);
 
     let mut history_column = column![].spacing(10);
     for (i, item) in state.history.iter().enumerate().rev() {
@@ -284,8 +287,9 @@ fn view(state: &AppState) -> Element<'_, Message> {
 
         let date_match = state.days_filter < 1.0 || (now - item.datetime) < Duration::days(state.days_filter as i64);
         let fav_match = !state.only_favorites || item.is_favorite;
+        let img_match = !state.only_images || item.is_image;
 
-        if query_match && date_match && fav_match {
+        if query_match && date_match && fav_match && img_match {
             let mut card_column = column![
                 row![
                     text(item.datetime.format("%d.%m %H:%M:%S").to_string()).size(11).color(Color::from_rgb(0.7, 0.7, 0.7)),
@@ -359,7 +363,8 @@ fn main() -> iced::Result {
             AppState { 
                 history: load_history(), _tray: tray, _hotkey_manager: hotkey_manager, is_visible: false,
                 last_toggle_time: Instant::now(), last_text: String::new(), last_image_hash: Vec::new(), 
-                search_query: String::new(), auto_start: check_auto_start(), days_filter: 0.0, only_favorites: false
+                search_query: String::new(), auto_start: check_auto_start(), days_filter: 0.0, 
+                only_favorites: false, only_images: false
             }
         }, 
         update, view
